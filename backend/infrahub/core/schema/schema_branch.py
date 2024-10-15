@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Union
 
 from infrahub_sdk.topological_sort import DependencyCycleExistsError, topological_sort
 from infrahub_sdk.utils import compare_lists, deep_merge_dict, duplicates, intersection
+from pydantic import BaseModel, Field
 from typing_extensions import Self
 
 from infrahub.core.constants import (
@@ -63,6 +64,31 @@ if TYPE_CHECKING:
 
 
 # pylint: disable=redefined-builtin,too-many-public-methods,too-many-lines
+class ComputedAttributeTarget(BaseModel):
+    kind: str
+    attribute: str
+
+
+class RegisteredNodeComputedAttribute(BaseModel):
+    attributes: dict[str, list[ComputedAttributeTarget]] = Field(default_factory=dict)
+    relationships: dict[str, list[ComputedAttributeTarget]] = Field(default_factory=dict)
+
+    def get_targets(self, updates: list[str]) -> list[ComputedAttributeTarget]:
+        targets = []
+
+        for attribute, entries in self.attributes.items():
+            if attribute in updates:
+                for entry in entries:
+                    if entry not in targets:
+                        targets.append(entry)
+
+        for attribute, entries in self.relationships.items():
+            if attribute in updates:
+                for entry in entries:
+                    if entry not in targets:
+                        targets.append(entry)
+
+        return targets
 
 
 class SchemaBranch:
@@ -74,6 +100,7 @@ class SchemaBranch:
         self.profiles: dict[str, str] = {}
         self._graphql_schema: Optional[GraphQLSchema] = None
         self._graphql_manager: Optional[GraphQLSchemaManager] = None
+        self._computed_macro_map: dict[str, RegisteredNodeComputedAttribute] = {}
 
         if data:
             self.nodes = data.get("nodes", {})
@@ -948,6 +975,7 @@ class SchemaBranch:
                     ) from None
 
     def validate_computed_attributes(self) -> None:
+        self._computed_macro_map = {}
         for name in self.nodes.keys():
             node_schema = self.get_node(name=name, duplicate=False)
             for attribute in node_schema.attributes:
@@ -1000,10 +1028,49 @@ class SchemaBranch:
                         f"{node.kind}: Attribute {attribute.name!r} the '{variable}' variable is a reference to itself"
                     )
 
+                self._register_computed_attribute_target(node=node, attribute=attribute, schema_path=schema_path)
+
         if attribute.assignment_type == AttributeAssignmentType.TRANSFORM and not attribute.optional:
             raise ValueError(
                 f"{node.kind}: Attribute {attribute.name!r} is a computed transform, it can't be mandatory"
             )
+
+    def get_impacted_macros(self, kind: str, updates: list[str]) -> list[ComputedAttributeTarget]:
+        if mapping := self._computed_macro_map.get(kind):
+            return mapping.get_targets(updates=updates)
+
+        return []
+
+    def _register_computed_attribute_target(
+        self, node: NodeSchema, attribute: AttributeSchema, schema_path: SchemaAttributePath
+    ) -> None:
+        key = node.kind
+        if schema_path.is_type_relationship:
+            key = schema_path.active_relationship_schema.peer
+
+        if key not in self._computed_macro_map:
+            self._computed_macro_map[key] = RegisteredNodeComputedAttribute()
+
+        source_attribute = ComputedAttributeTarget(kind=node.kind, attribute=attribute.name)
+        trigger_node = self._computed_macro_map[key]
+        if schema_path.is_type_attribute:
+            if schema_path.active_attribute_schema.name not in trigger_node.attributes:
+                trigger_node.attributes[schema_path.active_attribute_schema.name] = []
+
+            if source_attribute not in trigger_node.attributes[schema_path.active_attribute_schema.name]:
+                trigger_node.attributes[schema_path.active_attribute_schema.name].append(source_attribute)
+        elif schema_path.is_type_relationship:
+            if schema_path.active_attribute_schema.name not in trigger_node.attributes:
+                trigger_node.attributes[schema_path.active_attribute_schema.name] = []
+
+            if source_attribute not in trigger_node.attributes[schema_path.active_attribute_schema.name]:
+                trigger_node.attributes[schema_path.active_attribute_schema.name].append(source_attribute)
+
+            if schema_path.active_relationship_schema.name not in trigger_node.relationships:
+                trigger_node.relationships[schema_path.active_relationship_schema.name] = []
+
+            if source_attribute not in trigger_node.relationships[schema_path.active_relationship_schema.name]:
+                trigger_node.relationships[schema_path.active_relationship_schema.name].append(source_attribute)
 
     def validate_count_against_cardinality(self) -> None:
         """Validate every RelationshipSchema cardinality against the min_count and max_count."""
